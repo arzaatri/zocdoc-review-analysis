@@ -1,0 +1,603 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+OVERALL SETUP
+
+```{r message=FALSE, warning=FALSE}
+options(warn=-1)
+
+library(tidyverse)
+library(quanteda)
+library(quanteda.textstats)
+library(quanteda.textmodels)
+library(lexicon)
+library(caret)
+library(ggplot2)
+library(stringr)
+library(reshape2)
+
+setwd('C:/Users/arzaa/teda_project')
+
+
+reviews <- read_csv('zocdoc_data.csv', show_col_types = FALSE)
+reviews_dfm <- reviews$Review %>%  tokens(remove_punct=TRUE, remove_numbers=TRUE, remove_symbols=TRUE) %>% tokens_tolower() %>%  tokens_replace(pattern=hash_lemmas$token, replacement=hash_lemmas$lemma) %>% tokens_select(pattern = stopwords("en"), selection = "remove") %>% dfm()
+head(reviews)
+
+# To make a corpus after selecting a subset from the tibble
+make_corpus_or_tokenize <- function(x, remove_stop=TRUE, lemmatize=TRUE, tolower=TRUE, remove_punct=TRUE, tokenize=FALSE) {
+  # x should be (a subset of) reviews$Review
+  corp <- x %>% tokens(remove_punct=remove_punct, remove_numbers=TRUE, remove_symbols=TRUE)
+  
+  if (tolower) {
+    corp <- corp %>% tokens_tolower()
+  }
+  
+  if (remove_stop) {
+    corp <- corp %>% tokens_select(pattern = stopwords("en"), selection = "remove") 
+  }
+  
+  if (lemmatize) {
+    corp <- corp %>% tokens_replace(pattern=hash_lemmas$token, replacement=hash_lemmas$lemma)
+  }
+  
+  if (tokenize) {
+    return(corp)
+  }
+  corp %>% corpus()
+}
+
+token_count <- function(x, n=20, remove_stop=TRUE, lemmatize=TRUE, tolower=TRUE, remove_punct=TRUE) {
+  # x should be (a subset of) reviews$Review
+  x_dfm <- x %>% make_corpus_or_tokenize(remove_stop=remove_stop, lemmatize=lemmatize, tolower=tolower, remove_punct=remove_punct, tokenize=TRUE) %>% dfm()
+  textstat_frequency(x_dfm, n=n)
+}
+```
+
+# Basic statistics of the corpus
+
+```{r}
+avg_len = reviews$Review %>% tokens() %>% lapply(FUN=length) %>% unlist() %>% unname() %>% mean() %>% round()
+paste('Size of corpus:', nrow(reviews))
+paste('Average length of documents:', avg_len)
+paste('# unique tokens after lemmatization and removal of stopwords:', ncol(reviews_dfm))
+```
+
+# Analyzing tokens, bigrams, etc
+
+**Most common tokens overall**
+
+```{r}
+tc <- token_count(reviews$Review, n=30) 
+tc
+```
+
+Among the meaningful words in this result, we find "time," "feel," "office," "professional," and "care." Time, feel, and professional reveal several more obvious priorities patients have when visiting a doctor - how much time in takes (i.e. the wait AND the visit itself - more on the latter below), how the doctor makes them feel (though this token may also included instances of "I felt ill"), and how professionally the doctor acts. Less obvious but still logical was "office," as the quality of the office is apparently important to the patient experience, and "care." This last word is difficult to infer anything from on its own and requires deeper investigation. At rank 12, "staff" also makes an appearance, revealing that the doctor's additional staff - nurses, receptionists, etc. - matter to the patient's review as well.
+
+
+**Most common collocations**
+
+```{r}
+reviews_corpus <- reviews$Review %>% tokens() %>%  tokens_replace(pattern=hash_lemmas$token, replacement=hash_lemmas$lemma) %>% tokens_select(pattern = stopwords("en"), selection = "remove") 
+collocs <- textstat_collocations(reviews_corpus)
+collocs
+```
+
+"Take time" is on top, which already informs my preconceptions on what people like in a doctor. Naturally, they want a short wait ("wait time" is #9, and a future look at some keywords in context will likely reveal words such as "short" or "long" nearby); that said, once the doctor is actually seeing you, reviewers don't want the visit to end ASAP. This collocation implies that they prefer that phase to be thorough - a logical result. It's worth investigation how common "take time" is among positive reviews specifically.
+
+# Analysis by positive/negative
+
+**Analyzing by DOCUMENT frequency: Which words have the highest/lowest occurrence ratio for pos/neg docs?**
+
+
+```{r message=FALSE, warning=FALSE}
+reviews_pos <- reviews %>% filter(OverallRating >= 4)
+reviews_neg <- reviews %>% filter(OverallRating < 4)
+
+# Get frequencies
+# Use more terms in token count so we can catch those which
+# are common in one class but rare in another
+pos_freqs <- token_count(reviews_pos$Review, n=200) %>% tibble() %>%  mutate(docfreq = docfreq/sum(docfreq))
+
+neg_freqs <- token_count(reviews_neg$Review, n=200) %>% tibble() %>%  mutate(docfreq = docfreq/sum(docfreq))
+
+# Join by feature (token)
+# Some terms will be absent from one class. After join, impute
+# these with some small number so no division by 0 occurs
+# Impute value is 1/10 of the lowest docfreq
+freqs <- full_join(pos_freqs, neg_freqs, by="feature", suffix=c('.pos','.neg')) %>% mutate(docfreq.pos = ifelse(is.na(docfreq.pos), min(docfreq.pos, na.rm=TRUE)/10, docfreq.pos)) %>% mutate(docfreq.neg = ifelse(is.na(docfreq.neg), min(docfreq.neg, na.rm=TRUE)/10, docfreq.neg)) %>%  mutate(ratio=docfreq.pos/docfreq.neg) %>% select(c(feature, ratio)) %>% arrange(desc(ratio))
+
+# More common in positive than negative
+freqs[1:20,]
+# More common in negative than positive
+freqs[(nrow(freqs)-19):nrow(freqs),]
+```
+
+Same thing but with collocations:
+
+```{r}
+make_collocs <- function(x, pos=TRUE) {
+  if (pos) {
+    corp <- reviews %>% filter(OverallRating >= 4) 
+  }
+  else {
+    corp <- reviews %>% filter(OverallRating < 4)
+  }
+  corp$Review %>%  tokens(remove_punct=TRUE, remove_numbers=TRUE) %>%  tokens_replace(pattern=hash_lemmas$token, replacement=hash_lemmas$lemma) %>% tokens_select(pattern = stopwords("en"), selection = "remove") %>% textstat_collocations() %>% arrange(desc(count))
+}
+
+pos_collocs <- make_collocs(reviews)
+neg_collocs <- make_collocs(reviews, pos=FALSE)
+
+pos_collocs
+neg_collocs
+```
+
+
+**What are the most common words with a positive/negative connotation? Note that this is analyzed irrespective of review class**
+
+```{r message=FALSE, warning=FALSE}
+reviews_toks <- make_corpus_or_tokenize(reviews$Review, tokenize=TRUE)
+
+paste('Positive features')
+pos_feats <- tokens_select(reviews_toks, pattern = data_dictionary_LSD2015["positive"]) %>%
+  dfm() %>%
+  topfeatures()
+pos_feats
+paste('')
+paste('Negative features')
+neg_feats <- tokens_select(reviews_toks, pattern = data_dictionary_LSD2015["negative"]) %>%
+  dfm() %>%
+  topfeatures()
+neg_feats
+```
+
+
+**What negative words pop up in 5-star reviews?**
+
+```{r}
+reviews_toks_5 <- reviews %>% filter(OverallRating==5) %>% select(Review) %>% pull() %>%  make_corpus_or_tokenize(tokenize=TRUE)
+tokens_select(reviews_toks_5, pattern = data_dictionary_LSD2015["negative"]) %>%
+  dfm() %>%
+  topfeatures(n=20)
+```
+
+Would need to do collocations for the above to have proper context. "wait" could be "short wait," for instance
+
+# Analysis by specialty
+
+First off: What specialties are there, and how many doctors for each?
+
+```{r}
+reviews %>% group_by(Specialty) %>% summarise(count_revs=n(), count_docs=n_distinct(DocName)) %>% arrange(desc(count_revs))
+```
+
+Multiple things are revealed about our data here. For one, most doctors has no specialty listed. This is either a limitation of Zocdoc, which may not have required this field at the time, or a flaw in the scraping procedure that gathered this data. One way or another, I will limit analysis to those doctors with a specialty listed. Naturally, some specialties are more rare than others, which limits our ability to infer if there are any particular qualities more desirable in a neurologist, for instance. To keep the scope of the problem reasonable, I will limit analysis to the top 5 specialties by count.
+
+```{r}
+specialties <- reviews %>% group_by(Specialty) %>% summarise(count=n()) %>% filter(count >= 80) %>% filter(!is.na(Specialty)) %>% arrange(desc(count)) %>% select(Specialty) %>% slice_head(n=5)
+reviews_subset <- reviews %>% filter(Specialty %in% specialties$Specialty)
+```
+
+**Similar to pos/neg above: Which words appear more in one specialty that in others?**
+
+The ratio metric here is less obvious since there are multiple classes. I'll use document frequency in the given specialty divided by all other document frequencies.
+
+```{r}
+# Since we are grouping we can't just pass the reviews
+# x is the df minus the group variable, y is the group var value
+token_count_group <- function(x, y, n=200, remove_stop=TRUE, lemmatize=TRUE, tolower=TRUE, remove_punct=TRUE) {
+
+
+  corp <- x$Review %>% tokens(remove_punct=remove_punct)
+  
+  if (tolower) {
+    corp <- corp %>% tokens_tolower()
+  }
+  
+  if (remove_stop) {
+    corp <- corp %>% tokens_select(pattern = stopwords("en"), selection = "remove") 
+  }
+  
+  if (lemmatize) {
+    corp <- corp %>% tokens_replace(pattern=hash_lemmas$token, replacement=hash_lemmas$lemma)
+  }
+
+  corp <- corp %>% dfm() %>% textstat_frequency(n=n) %>% tibble() %>%  mutate(Specialty=y$Specialty[1], docfreq=docfreq/sum(docfreq))
+  corp[c('feature','docfreq','Specialty')]
+}
+
+# bind_rows can make a list of tibbles into a single tibble
+res <- reviews_subset %>% group_by(Specialty) %>% group_map(token_count_group) #%>% bind_rows()
+#res
+
+# Now calculate ratios... somehow
+# I guess don't rbind, but join them with their specialty as suffix? 
+# Then impute
+# Then, for each row, take the highest docfreq and divide it by
+# the sum of the rest?
+
+# Set suffix on docfreq asap so don't have to worry about join sufic
+df <- res[[1]]
+colnames(df)[2] <- paste(colnames(df)[2], '.', df$Specialty[1], sep='')
+df <- df[c('feature','docfreq.Family Physician')]
+
+# Do the joins, and change docfreq's name as it is added
+for (i in 2:length(res)) {
+  next_tibble <- res[[i]][c('feature','docfreq')]
+  df <- full_join(df, next_tibble, by='feature')
+  new_name <- paste('docfreq.', res[[i]]$Specialty[1], sep='')
+  df <- rename(df, !!new_name:=docfreq)
+}
+
+# Impute each col with 1/10 of its minimum value, as before
+# Actually, might be better to each ROW by 1/10 of its min
+# Or maybe 1/10 of the global min?
+docfreq_cols <- colnames(df)[-1]
+df[is.na(df)] <- min(df[docfreq_cols], na.rm = TRUE)/10
+
+# Get which cols have the highest docfreq per word
+colmaxes <- max.col(df[,-1])+1 # add 1 to get actual column index in df
+
+# Initialize cols to be filled in with results
+df <- df %>% mutate(ratio=0, maxcol='a')
+
+for (i in 1:nrow(df)) {
+  # Divide highest ratio in row by mean of other ratios
+  df$ratio[i] <- df[i,colmaxes[i]] %>% pull() / rowMeans(df[i,-c(1,colmaxes[i],7,8)])
+  # Safe which column that ratio belongs to
+  df$maxcol[i] <- docfreq_cols[colmaxes[i]-1]
+}
+```
+
+```{r}
+myfunc <- function(x, y) {
+  #paste('Most common for' str_split(y %>% pull())[2])
+  spec <- (y %>% pull() %>% str_split('\\.'))[[1]][2]
+  #print(spec)
+  x %>% arrange(desc(ratio)) %>% select(feature, ratio) %>% mutate(Specialty=spec)
+}
+df %>% group_by(maxcol) %>% group_map(myfunc)
+```
+
+
+
+# Modeling rating from review
+
+There are two ways that we can model rating: we can either do a multiclass problem with all 5 ratings, or binarize the labels as we did in the positive/negative analysis. There are various considerations to be made either way. If we stick with the labels as-is, then we have a class imbalance problem:
+
+```{r}
+ggplot(reviews, mapping=aes(OverallRating)) +
+  geom_bar()+
+  theme_bw()
+```
+
+We have far more 5 star reviews than any other number. There are various psychological reasons why a patient may choose a 5-star review, aside from that the visit was truly perfect. For instance, if a doctor has a 4.5 and the patient felt that there were only minor issues, the patient may be unwilling to give a 4, as this would lower the doctor's average. Simple generosity could be at play, as well: "This person helped me, so now I will help them by giving a 5." Or it could be that patients have a high standard for what must go wrong in order for a doctor to "deserve" an imperfect score. Regardless of the reason, class imbalance will make it easy for our model to achieve high accuracy.
+'
+What if we binarize the label? When I did word frequency analysis, I chose to define reviews >= 4 as positive, and < 4 as negative. That is one option, but there are other ways to binarize as well; one such framing would be to make it an question of 5 stars vs. not 5 stars, which would capture the question of "Did the patient find the visit perfect or not?" We could even generate our own labels for this question: if the review has no negative sentiment words we could place it in the positive ("perfect") class, and vice-versa.
+
+For now, I'll start by predicting the rating from 1-5:
+
+**Naive Bayes**
+
+SETUP CELL FOR MODELING
+
+```{r}
+make_dfm <- function(x) {
+  x %>% tokens(remove_punct=TRUE, remove_numbers=TRUE, remove_symbols=TRUE) %>% tokens_tolower() %>%  tokens_replace(pattern=hash_lemmas$token, replacement=hash_lemmas$lemma) %>% tokens_select(pattern = stopwords("en"), selection = "remove") %>% dfm()
+}
+
+reviews$target <- factor(reviews$OverallRating >= 4)
+
+# train/val/test split
+set.seed(111)
+id_trainval <- sample(1:nrow(reviews), 0.7*nrow(reviews), replace=FALSE)
+id_val <- sample(id_trainval, 0.15/0.7*length(id_trainval), replace=FALSE)
+id_train <- setdiff(id_trainval, id_val)
+id_test <- setdiff(1:nrow(reviews), id_trainval)
+
+X_train <- reviews[id_train,]$Review %>% make_dfm()
+y_train <- reviews$OverallRating[id_train]
+X_val <- reviews[id_val,]$Review %>% make_dfm() %>% dfm_match(featnames(X_train))
+y_val <- reviews$OverallRating[id_val]
+X_test <- reviews[id_test,]$Review %>% make_dfm() %>% dfm_match(featnames(X_train))
+y_test <- reviews$OverallRating[id_test]
+
+# Set up functions for evaluation
+eval_nb <- function(mod, Xt, yt) {
+  preds <- predict(mod, Xt)
+
+  # Evaluate on test and assess confusion matrix
+  paste('Accuracy:', sum(preds==yt)/length(preds))
+  
+  if ( length(unique(yt))  > 2 ) {
+    cmat <- confusionMatrix(preds, factor(yt))
+  }
+  else {
+    cmat <- confusionMatrix(preds, factor(yt), positive="TRUE")
+  }
+  
+  cmat
+}
+
+over_under_nb <- function(mod, Xt, yt) {
+  preds <- predict(mod, Xt)
+  
+  metrics <- tibble(preds, yt) %>% group_by(yt) %>% summarise(underpredict=sum(as.numeric(preds)<as.numeric(yt))/n(), overpredict=sum(as.numeric(preds)>as.numeric(yt))/n(), count=n(), correct=sum(as.numeric(preds)==as.numeric(yt))/n()) %>% rename(OverallRating=yt)
+  
+metrics[c('OverallRating','underpredict','overpredict','correct','count')]
+}
+
+# Gets the top terms by model coefficient for each rating
+get_top_terms <- function(mod, n=20) {
+  melt(coef(mod)) %>% rename(feature=Var1, Class=Var2, coefficient=value) %>% data.frame() %>% group_by(Class) %>% group_map(coef_func, n=n)
+}
+
+
+# Accessory function to the above, gets top n coefficients by group
+coef_func <- function(x, y, n=20) {
+  x %>% arrange(desc(coefficient)) %>% slice_head(n=n) %>% mutate(Class=y %>% pull())
+}
+```
+
+**Modeling without downsampling or binarizing**
+
+```{r}
+# Hyperparameters include prior and distribution
+params <- expand_grid(c('uniform','docfreq','termfreq'), c('Bernoulli','multinomial'))
+colnames(params) <- c('prior', 'distribution')
+params$acc <- 0 # Will be filled in as we loop
+
+for (i in 1:nrow(params)) {
+  mod_nb <- textmodel_nb(X_train, y_train,
+                         prior=params$prior[i],
+                         distribution=params$distribution[i])
+  preds <- predict(mod_nb, newdata=X_val)
+  params$acc[i] <- sum(preds == y_val) / length(preds)
+}
+params
+```
+
+Winner: (docfreq, multinomial). Docfreq makes sense due to the class imbalance
+
+```{r}
+# Retrain best model on train AND val data, get test preds
+X_trainval <- rbind(X_train, X_val)
+y_trainval <- c(y_train, y_val)
+mod_nb <- textmodel_nb(X_trainval, 
+                       y_trainval,
+                       prior='docfreq',
+                       distribution='multinomial')
+
+eval_nb(mod_nb, X_test, y_test)
+```
+
+
+TALK
+ABOUT
+THE
+METRICS
+
+
+As another metric, let's summarize our model's tendency to overpredict by class:
+
+```{r}
+over_under_nb(mod_nb, X_test, y_test)
+```
+
+The model has a far greater tendency to overpredict, which gives us ample reason to believe that the high number of 5-star reviews is causing our model to overshoot its mark. In addition, we can see that the model's high accuracy is almost entirely due to its ability to accurately predict 5-star reviews. Future iterations of this model will employ downsampling to avoid this. Downsampling to ~1000 5-star reviews and binarizing with positive labels being >= 4 stars will yield a positive:negative class ratio of approximately 5:2, which is acceptable.
+
+Let's redo the model with downsampling. I'll use the same hyperamaters for the sake of time, and because it lines up with analysis done elsewhere in this project.
+
+**Downsampling**
+
+SETUP CELL FOR DOWNSAMPLING
+
+```{r}
+# Downsample the training data: Find indexes where there are 5's and choose
+# only 1000 of them
+set.seed(111)
+ratings_trainval <- reviews$OverallRating[id_trainval]
+downsampled_id <- which(ratings_trainval == 5) %>% sample(1000)
+downsampled_id <- c(which(ratings_trainval < 5), 
+                    downsampled_id
+                    ) 
+# Converts downsampled_id from rows of the trainval subset, to rows of the
+# entire corpus
+downsampled_id <- id_trainval[downsampled_id]
+
+X_trainval_d <- reviews_dfm[downsampled_id,]
+y_trainval_d <- reviews$OverallRating[downsampled_id]
+X_test_d <- X_test %>% dfm_match(featnames(X_trainval_d))
+```
+
+**Model with downsampling but no binarizing**
+
+```{r}
+# Refit the model
+mod_nb_d <- textmodel_nb(X_trainval_d, 
+                       y_trainval_d,
+                       prior='docfreq',
+                       distribution='multinomial')
+
+eval_nb(mod_nb_d, X_test_d, y_test)
+over_under_nb(mod_nb_d, X_test_d, y_test)
+```
+
+Looking at the diagonal of the confusion matrix, we see that the model now achieves far better predictive ability in classes < 5, but this comes at the hefty price of worse predictions on 5's. Accuracy is not a perfect metric here, as most of those predictions were 4's, which is close. That said, accuracy across all other ratings is significantly up, which means our model is indeed better at telling when a review is negative.
+
+Now we to peer into the part of the model we were actually interested in: coefficients. This is a causal problem, and the coefficients, not the predictions, are the useful part for inferring what makes a patient give a positive review.
+
+```{r}
+get_top_terms(mod_nb_d)
+```
+
+
+**Now with downsampling and binarizing**
+
+SETUP CELL FOR BINARIZING
+
+```{r}
+y_trainval_db <- (y_trainval_d >= 4)
+y_test_b <- y_test >= 4
+```
+
+
+```{r}
+mod_nb_db <- textmodel_nb(X_trainval_d, 
+                       y_trainval_db,
+                       prior='docfreq',
+                       distribution='multinomial')
+
+eval_nb(mod_nb_db, X_test_d, y_test_b)
+```
+
+```{r}
+get_top_terms(mod_nb_db)
+```
+
+```{r}
+library(viridis)
+cm <- eval_nb(mod_nb_db, X_test_d, y_test_b)$table
+cm[,1] = cm[,1] / sum(cm[,1])
+cm[,2] = cm[,2] / sum(cm[,2])
+cm <- cm %>% melt() %>% rename(Proportion=value)
+
+ggplot(cm, aes(Reference, Prediction, fill=Proportion))+
+  geom_tile()+
+  geom_text(aes(label=round(Proportion,2)))+
+  theme_bw()
+```
+
+```{r}
+coefs <- coef(mod_nb_db) %>% data.frame() %>% rename(False=FALSE., True=TRUE.)
+coefs <- cbind(Term = rownames(coefs), coefs) %>% mutate(tf_ratio=True/False)
+coefs <- rbind(
+  coefs %>% arrange(desc(tf_ratio)) %>% slice_head(n=30), # top pos
+  coefs %>% arrange(tf_ratio) %>% slice_head(n=30) # top neg
+)
+coefs <- coefs %>% filter(!(Term %in% c('degenhardt','raffinan','hojraj','wang','milani','oh','samson')))
+#coefs <- coefs[1:20,]
+coefs
+```
+```{r}
+coefs_g <- coefs[,1:3] %>% gather(Class, Coefficient, -Term) %>% mutate(Class=ifelse(Class=='False', 'Negative', 'Positive'))
+coefs_g$Term <- factor(coefs_g$Term, levels=unique(coefs_g$Term))
+ggplot(coefs_g, aes(Term, Coefficient, fill=Class))+
+  geom_col(position='dodge')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0, hjust=1, size=8))
+
+```
+
+```{r}
+coefs2 <- coef(mod_nb_db) %>% data.frame() %>% rename(False=FALSE., True=TRUE.)
+coefs2 <- cbind(Term = rownames(coefs2), coefs2) %>% mutate(tf_ratio=True/False) %>% mutate(adj_tf_ratio_pos=tf_ratio*True, adj_tf_ratio_neg=tf_ratio/False)
+coefs2 <- rbind(
+  coefs2 %>% arrange(desc(adj_tf_ratio_pos)) %>% slice_head(n=15), # top pos
+  coefs2 %>% arrange(adj_tf_ratio_neg) %>% slice_head(n=15) # top neg
+)
+
+coefs2
+
+```
+
+**Random Forest with downsampling and binarizing**
+
+Run setup cells above (For notebook, modeling)
+
+SETUP CELL FOR RF
+
+```{r}
+library(randomForest)
+
+# Need to redo downsampling since before I just used train/test, not train/val/test
+
+set.seed(111)
+downsampled_id <- which(y_train == 5) %>% sample(1000)
+downsampled_id <- c(which(y_train < 5), downsampled_id) 
+downsampled_id <- id_train[downsampled_id]
+
+X_train_rf <- reviews[downsampled_id,]$Review %>% make_dfm()
+y_train_rf <- factor(reviews$OverallRating[downsampled_id] >= 4)
+# Remember, val and test X stay the same as the true distribution.
+# Just need to binarize y
+y_val_rf <- factor(y_val >= 4)
+y_test_rf <- factor(y_test >= 4)
+
+# Convert val and test dfm's to matrix, as randomForest isn't part of quanteda. Also feature match them as X_train may now be missing some features
+X_val_rf <- X_val %>% dfm_match(featnames(X_train_rf)) %>% convert("matrix")
+X_test_rf <- X_test %>% dfm_match(featnames(X_train_rf)) %>% convert("matrix")
+X_train_rf <- X_train_rf %>% convert("matrix")
+```
+NOTE: I comment out certain lines below for convenience when knitting
+
+```{r}
+# First do hyperparameter tuning
+nc <- ncol(X_train_rf)
+params_rf <- expand.grid(
+  c(100,200,500),
+  c(0.75*sqrt(nc), sqrt(nc), 1.25*sqrt(nc)) %>% floor()
+) %>% as.data.frame()
+colnames(params_rf) <- c('ntree','mtry')
+
+res <- c(0)
+print(paste("Beginning", nrow(params_rf), "iterations."))
+# for (i in 1:nrow(params_rf)) {
+#   print(i)
+#   p <- params_rf[i,]
+#   rf <- randomForest(x = X_train_rf, y = y_train_rf,
+#                      importance = TRUE,
+#                      ntree=p[1] %>% pull(),
+#                      mtry=p[2] %>% pull())
+#   preds <- predict(rf, newdata=X_val_rf)
+#   res[i] <- mean(preds == y_val_rf)
+# }
+# amax_res <- which(res == max(res))
+# paste("Best paramaters:", params_rf[amax_res,])
+# paste("Accuracy:", max(res))
+```
+
+Best params: 500 trees, 68 (sqrt(nc)) mtry. Defaults are defaults for a reason.
+
+```{r}
+library(caret)
+# rf <- randomForest(x = rbind(X_train_rf, X_val_rf),
+#                    y = c(y_train_rf, y_val_rf),
+#                    importance = TRUE
+#                    )
+#save(rf, file="rf.Rdata")
+load('C:/Users/arzaa/teda_project/rf.Rdata')
+preds <- predict(rf, newdata=X_test_rf)
+confusionMatrix(y_test_rf, preds)
+```
+
+
+```{r}
+token_imp <- round(importance(rf, 2), 2) %>% as.data.frame() %>% arrange(desc(MeanDecreaseGini))
+token_imp$token <- row.names(token_imp)
+token_imp[1:20,]
+```
+
+Plotting RF confusion matrix:
+
+```{r}
+library(ggplot2)
+
+load('C:/Users/arzaa/teda_project/rf.Rdata')
+preds <- predict(rf, newdata=X_test_rf)
+cm <- confusionMatrix(y_test_rf, preds)$table
+cm[,1] = cm[,1] / sum(cm[,1])
+cm[,2] = cm[,2] / sum(cm[,2])
+cm <- cm %>% melt() %>% rename(Proportion=value)
+
+
+ggplot(cm, aes(Reference, Prediction, fill=Proportion))+
+  geom_tile()+
+  geom_text(aes(label=round(Proportion,2)))+
+  theme_bw()
+```
+
